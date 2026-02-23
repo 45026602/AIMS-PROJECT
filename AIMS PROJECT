@@ -1,0 +1,471 @@
+# %%
+# Cell 1: Imports and Setup
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.decomposition import PCA
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, 
+                             average_precision_score, confusion_matrix, matthews_corrcoef, 
+                             cohen_kappa_score, balanced_accuracy_score, roc_curve, precision_recall_curve)
+from scipy.spatial.distance import mahalanobis  # For HBOS-like
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os  # For directory creation and path joining
+sns.set(style="whitegrid")
+
+# Create save directory
+save_dir = r'C:\Users\45026602\Documents\Lindani\2025\SOLO\Faith\Churn'
+os.makedirs(save_dir, exist_ok=True)
+print(f"Plots will be saved to: {save_dir}")
+
+# %%
+# Cell 2: Load Data and Feature Engineering
+df = pd.read_csv('CHUR.csv')
+
+# Basic info
+print("Dataset shape:", df.shape)
+print("\nChurn distribution:\n", df['churn'].value_counts(normalize=True))
+
+# Target
+y = df['churn']
+X = df.drop(['churn', 'customer_id'], axis=1)
+
+# Enhanced Feature Engineering (adapted for churn dataset)
+df['age_group'] = pd.cut(df['age'], bins=[0, 30, 50, 100], labels=[0, 1, 2]).astype(int)
+df['balance_salary_ratio'] = df['balance'] / (df['estimated_salary'] + 1e-6)
+df['high_balance'] = (df['balance'] > df['balance'].quantile(0.75)).astype(int)
+df['low_credit'] = (df['credit_score'] < df['credit_score'].quantile(0.25)).astype(int)
+df['long_tenure'] = (df['tenure'] > df['tenure'].quantile(0.75)).astype(int)
+df['risk_score'] = df['low_credit'] + (1 - df['active_member']) + (df['products_number'] == 1).astype(int)
+
+# Update X to include new features (drop customer_id and churn)
+X = df.drop(['churn', 'customer_id'], axis=1)
+
+# Feature Selection
+selector = VarianceThreshold(threshold=0.01)
+X_selected = selector.fit_transform(X)
+selected_columns = X.columns[selector.get_support()]
+X = pd.DataFrame(X_selected, columns=selected_columns)
+
+# PCA for noise reduction
+pca = PCA(n_components=0.95, random_state=42)
+X_pca = pca.fit_transform(X)
+X = pd.DataFrame(X_pca)
+print(f"PCA reduced to {X.shape[1]} components (95% variance)")
+
+# %%
+# Cell 3: Data Splitting and Scaling
+# Split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+print("\nTrain churn rate:", y_train.mean())
+print("Test churn rate:", y_test.mean())
+
+# Normal train (non-churn)
+X_train_normal = X_train[y_train == 0]
+
+# Val split
+X_fit_normal, X_val_normal = train_test_split(X_train_normal, test_size=0.2, random_state=42)
+X_val_anom = X_train[y_train == 1]
+X_val = pd.concat([X_val_normal, X_val_anom])
+y_val = np.concatenate([np.zeros(len(X_val_normal)), np.ones(len(X_val_anom))])
+
+# Scaling
+scaler = RobustScaler()
+X_fit_normal_scaled = scaler.fit_transform(X_fit_normal)
+X_val_scaled = scaler.transform(X_val)
+X_train_normal_scaled = scaler.transform(X_train_normal)
+X_test_scaled = scaler.transform(X_test)
+
+contamination = y.mean()
+print("\nContamination:", contamination)
+
+# %%
+# Cell 4: Validation AUC Function
+def val_auc(model, X_val_scaled, y_val):
+    if hasattr(model, 'decision_function'):
+        decision = model.decision_function(X_val_scaled)
+        return roc_auc_score(y_val, -decision)
+    elif hasattr(model, 'score_samples'):
+        scores = model.score_samples(X_val_scaled)
+        return roc_auc_score(y_val, -scores)
+    return 0
+
+# %%
+# Cell 5: Hyperparameter Tuning and Model Fitting
+# Expanded Tune IF (adjusted for ~20% churn rate)
+best_score_if = -np.inf
+best_cont_if = 0.1
+best_nest_if = 200
+for cont in [0.1, 0.15, 0.2, 0.25]:  # Adjusted for ~20% churn rate
+    for nest in [200, 300, 400]:
+        model = IsolationForest(contamination=cont, n_estimators=nest, max_samples=0.8, random_state=42)
+        model.fit(X_fit_normal_scaled)
+        score = val_auc(model, X_val_scaled, y_val)
+        if score > best_score_if:
+            best_score_if = score
+            best_cont_if = cont
+            best_nest_if = nest
+
+print("Best IF cont/nest:", best_cont_if, best_nest_if, "Val AUC:", best_score_if)
+
+# Best IF
+if_model = IsolationForest(contamination=best_cont_if, n_estimators=best_nest_if, max_samples=0.8, random_state=42)
+if_model.fit(X_train_normal_scaled)
+if_decision = if_model.decision_function(X_test_scaled)
+if_pred = (if_decision < 0).astype(int)
+
+# Expanded Tune OC
+best_score_oc = -np.inf
+best_nu_oc = 0.1
+best_gamma_oc = 'scale'
+for nu in [0.1, 0.15, 0.2, 0.25]:  # Adjusted for ~20% churn rate
+    for gamma in ['scale', 0.05, 0.1]:
+        model = OneClassSVM(nu=nu, kernel='rbf', gamma=gamma)
+        model.fit(X_fit_normal_scaled)
+        score = val_auc(model, X_val_scaled, y_val)
+        if score > best_score_oc:
+            best_score_oc = score
+            best_nu_oc = nu
+            best_gamma_oc = gamma
+
+print("Best OC nu/gamma:", best_nu_oc, best_gamma_oc, "Val AUC:", best_score_oc)
+
+# Best OC
+oc_model = OneClassSVM(nu=best_nu_oc, kernel='rbf', gamma=best_gamma_oc)
+oc_model.fit(X_train_normal_scaled)
+oc_decision = oc_model.decision_function(X_test_scaled)
+oc_pred = (oc_decision < 0).astype(int)
+
+# Expanded Tune LOF
+best_score_lof = -np.inf
+best_nn_lof = 15
+for nn in [10, 15, 20, 25]:
+    model = LocalOutlierFactor(n_neighbors=nn, contamination=contamination, novelty=True)
+    model.fit(X_train_normal_scaled)
+    lof_val_scores = -model.score_samples(X_val_scaled)
+    score = roc_auc_score(y_val, lof_val_scores)
+    if score > best_score_lof:
+        best_score_lof = score
+        best_nn_lof = nn
+
+print("Best LOF n_neighbors:", best_nn_lof, "Val AUC:", best_score_lof)
+
+# Best LOF
+lof_model = LocalOutlierFactor(n_neighbors=best_nn_lof, contamination=contamination, novelty=True)
+lof_model.fit(X_train_normal_scaled)
+lof_decision = -lof_model.score_samples(X_test_scaled)
+lof_pred = (lof_model.predict(X_test_scaled) == -1).astype(int)
+
+# HBOS-like with Mahalanobis (unsupervised statistical)
+cov_normal = np.cov(X_train_normal_scaled.T)
+inv_cov = np.linalg.inv(cov_normal)
+mean_normal = np.mean(X_train_normal_scaled, axis=0)
+hbos_decision = np.array([mahalanobis(x, mean_normal, inv_cov) for x in X_test_scaled])
+hbos_val_decision = np.array([mahalanobis(x, mean_normal, inv_cov) for x in X_val_scaled])
+best_score_hbos = roc_auc_score(y_val, hbos_val_decision)
+hbos_pred = (hbos_decision > np.percentile(hbos_decision, 100 * contamination)).astype(int)
+print("HBOS-like Val AUC:", best_score_hbos)
+
+# %%
+# Cell 6: Ensemble (for completeness, but not visualized separately)
+# Refined Ensemble (weights + F1-optimized threshold)
+val_scores = {
+    'if': -if_model.decision_function(X_val_scaled),
+    'oc': -oc_model.decision_function(X_val_scaled),
+    'lof': -lof_model.score_samples(X_val_scaled),
+    'hbos': hbos_val_decision
+}
+total_val = best_score_if + best_score_oc + best_score_lof + best_score_hbos
+weights = {
+    'if': best_score_if / total_val,
+    'oc': best_score_oc / total_val,
+    'lof': best_score_lof / total_val,
+    'hbos': best_score_hbos / total_val
+}
+
+ensemble_val_score = np.sum([weights[k] * val_scores[k][:, np.newaxis] for k in weights], axis=0).flatten()
+
+# Optimize threshold on val F1
+thresholds = np.linspace(ensemble_val_score.min(), ensemble_val_score.max(), 100)
+best_f1 = 0
+best_thresh = thresholds[20]  # Approx 80th percentile start
+for thresh in thresholds:
+    pred_val = (ensemble_val_score > thresh).astype(int)
+    f1 = f1_score(y_val, pred_val)
+    if f1 > best_f1:
+        best_f1 = f1
+        best_thresh = thresh
+
+print("Best val F1 thresh:", best_thresh, "F1:", best_f1)
+
+# Test ensemble
+test_scores = {
+    'if': -if_decision,
+    'oc': -oc_decision,
+    'lof': lof_decision,
+    'hbos': hbos_decision
+}
+ensemble_test_score = np.sum([weights[k] * test_scores[k][:, np.newaxis] for k in weights], axis=0).flatten()
+ensemble_pred = (ensemble_test_score > best_thresh).astype(int)
+
+# %%
+# Cell 7: Metrics Computation
+def compute_metrics(y_true, y_pred, anomaly_score):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    metrics = {
+        'TP': tp, 'TN': tn, 'FP': fp, 'FN': fn,
+        'Accuracy': accuracy_score(y_true, y_pred),
+        'Precision': precision_score(y_true, y_pred, zero_division=0),
+        'Recall': recall_score(y_true, y_pred, zero_division=0),
+        'F1-Score': f1_score(y_true, y_pred, zero_division=0),
+        'AUC-ROC': roc_auc_score(y_true, anomaly_score),
+        'AUC-PR': average_precision_score(y_true, anomaly_score),
+        'Balanced Accuracy': balanced_accuracy_score(y_true, y_pred),
+        'Specificity': tn / (tn + fp) if (tn + fp) > 0 else 0,
+        'NPV': tn / (tn + fn) if (tn + fn) > 0 else 0,
+        'MCC': matthews_corrcoef(y_true, y_pred),
+        'Cohen\'s Kappa': cohen_kappa_score(y_true, y_pred)
+    }
+    return metrics
+
+# Compute & Print
+if_metrics = compute_metrics(y_test, if_pred, -if_decision)
+oc_metrics = compute_metrics(y_test, oc_pred, -oc_decision)
+lof_metrics = compute_metrics(y_test, lof_pred, lof_decision)
+hbos_metrics = compute_metrics(y_test, hbos_pred, hbos_decision)
+
+print("\nAdvanced Isolation Forest Metrics:")
+for k, v in if_metrics.items():
+    print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+print("\nAdvanced One-Class SVM Metrics:")
+for k, v in oc_metrics.items():
+    print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+print("\nAdvanced LOF Metrics:")
+for k, v in lof_metrics.items():
+    print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+print("\nHBOS-like Metrics:")
+for k, v in hbos_metrics.items():
+    print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+# %%
+# Cell 8: Prepare Metrics DataFrame for Plotting
+models = ['IF', 'OC-SVM', 'LOF', 'HBOS']
+metrics_data = {
+    'Accuracy': [if_metrics['Accuracy'], oc_metrics['Accuracy'], lof_metrics['Accuracy'], hbos_metrics['Accuracy']],
+    'Precision': [if_metrics['Precision'], oc_metrics['Precision'], lof_metrics['Precision'], hbos_metrics['Precision']],
+    'Recall': [if_metrics['Recall'], oc_metrics['Recall'], lof_metrics['Recall'], hbos_metrics['Recall']],
+    'F1-Score': [if_metrics['F1-Score'], oc_metrics['F1-Score'], lof_metrics['F1-Score'], hbos_metrics['F1-Score']],
+    'AUC-ROC': [if_metrics['AUC-ROC'], oc_metrics['AUC-ROC'], lof_metrics['AUC-ROC'], hbos_metrics['AUC-ROC']],
+    'AUC-PR': [if_metrics['AUC-PR'], oc_metrics['AUC-PR'], lof_metrics['AUC-PR'], hbos_metrics['AUC-PR']],
+    'Balanced Accuracy': [if_metrics['Balanced Accuracy'], oc_metrics['Balanced Accuracy'], lof_metrics['Balanced Accuracy'], hbos_metrics['Balanced Accuracy']],
+    'Specificity': [if_metrics['Specificity'], oc_metrics['Specificity'], lof_metrics['Specificity'], hbos_metrics['Specificity']],
+    'MCC': [if_metrics['MCC'], oc_metrics['MCC'], lof_metrics['MCC'], hbos_metrics['MCC']],
+    "Cohen's Kappa": [if_metrics["Cohen's Kappa"], oc_metrics["Cohen's Kappa"], lof_metrics["Cohen's Kappa"], hbos_metrics["Cohen's Kappa"]]
+}
+metrics_df = pd.DataFrame(metrics_data, index=models)
+
+# %%
+# Cell 9: Plot 1 - Grouped Bar Chart for Core Metrics (Accuracy, Precision, Recall, F1)
+fig, ax = plt.subplots(figsize=(10, 6))
+metrics_df[['Accuracy', 'Precision', 'Recall', 'F1-Score']].plot(kind='bar', ax=ax)
+ax.set_title('Core Performance Metrics Comparison (Churn Dataset)')
+ax.set_ylabel('Score')
+ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'core_metrics_bar.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 10: Plot 2 - Bar Chart for AUC Metrics
+fig, ax = plt.subplots(figsize=(8, 5))
+metrics_df[['AUC-ROC', 'AUC-PR']].plot(kind='bar', ax=ax)
+ax.set_title('AUC Metrics Comparison (Churn Dataset)')
+ax.set_ylabel('Score')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'auc_metrics_bar.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 11: Plot 3 - Bar Chart for Balanced Metrics
+fig, ax = plt.subplots(figsize=(8, 5))
+metrics_df[['Balanced Accuracy', 'Specificity']].plot(kind='bar', ax=ax)
+ax.set_title('Balanced and Specificity Metrics Comparison (Churn Dataset)')
+ax.set_ylabel('Score')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'balanced_specificity_bar.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 12: Plot 4 - Bar Chart for Correlation Metrics
+fig, ax = plt.subplots(figsize=(8, 5))
+metrics_df[['MCC', "Cohen's Kappa"]].plot(kind='bar', ax=ax)
+ax.set_title('Correlation Metrics Comparison (MCC & Kappa) (Churn Dataset)')
+ax.set_ylabel('Score')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'correlation_metrics_bar.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 13: Plot 5 - ROC Curves Comparison
+fig, ax = plt.subplots(figsize=(8, 6))
+anomaly_scores = {'IF': -if_decision, 'OC-SVM': -oc_decision, 'LOF': lof_decision, 'HBOS': hbos_decision}
+for model, score in anomaly_scores.items():
+    fpr, tpr, _ = roc_curve(y_test, score)
+    ax.plot(fpr, tpr, label=f'{model} (AUC = {roc_auc_score(y_test, score):.3f})')
+
+ax.plot([0, 1], [0, 1], 'k--', label='Random')
+ax.set_xlabel('False Positive Rate')
+ax.set_ylabel('True Positive Rate')
+ax.set_title('ROC Curves Comparison (Churn Dataset)')
+ax.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'roc_curves.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 14: Plot 6 - Precision-Recall Curves Comparison
+fig, ax = plt.subplots(figsize=(8, 6))
+for model, score in anomaly_scores.items():
+    precision, recall, _ = precision_recall_curve(y_test, score)
+    ax.plot(recall, precision, label=f'{model} (AUC-PR = {average_precision_score(y_test, score):.3f})')
+
+ax.set_xlabel('Recall')
+ax.set_ylabel('Precision')
+ax.set_title('Precision-Recall Curves Comparison (Churn Dataset)')
+ax.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'pr_curves.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 15: Plot 7 - Confusion Matrices (Subplots)
+fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+confusion_matrices = {
+    'IF': confusion_matrix(y_test, if_pred),
+    'OC-SVM': confusion_matrix(y_test, oc_pred),
+    'LOF': confusion_matrix(y_test, lof_pred),
+    'HBOS': confusion_matrix(y_test, hbos_pred)
+}
+for idx, (model, cm) in enumerate(confusion_matrices.items()):
+    row, col = idx // 2, idx % 2
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axs[row, col])
+    axs[row, col].set_title(f'Confusion Matrix - {model} (Churn Dataset)')
+    axs[row, col].set_xlabel('Predicted')
+    axs[row, col].set_ylabel('Actual')
+
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'confusion_matrices.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 16: Plot 8 - Learning Curves (AUC vs Training Size)
+# Generate learning curves by subsampling training data
+train_sizes = np.linspace(0.1, 1.0, 10)
+lc_sizes = train_sizes * len(X_train_normal_scaled)
+lc_scores = {'IF': [], 'OC-SVM': [], 'LOF': [], 'HBOS': []}
+
+for size_frac in train_sizes:
+    n_samples = int(len(X_train_normal_scaled) * size_frac)
+    X_sub = X_train_normal_scaled[:n_samples]
+    
+    # IF
+    model_if = IsolationForest(contamination=best_cont_if, n_estimators=best_nest_if, max_samples=0.8, random_state=42)
+    model_if.fit(X_sub)
+    lc_scores['IF'].append(val_auc(model_if, X_val_scaled, y_val))
+    
+    # OC-SVM
+    model_oc = OneClassSVM(nu=best_nu_oc, kernel='rbf', gamma=best_gamma_oc)
+    model_oc.fit(X_sub)
+    lc_scores['OC-SVM'].append(val_auc(model_oc, X_val_scaled, y_val))
+    
+    # LOF
+    model_lof = LocalOutlierFactor(n_neighbors=best_nn_lof, contamination=contamination, novelty=True)
+    model_lof.fit(X_sub)
+    lof_sub_scores = -model_lof.score_samples(X_val_scaled)
+    lc_scores['LOF'].append(roc_auc_score(y_val, lof_sub_scores))
+    
+    # HBOS
+    if n_samples > X_sub.shape[1]:  # Ensure enough samples for cov
+        cov_sub = np.cov(X_sub.T)
+        try:
+            inv_cov_sub = np.linalg.inv(cov_sub)
+            mean_sub = np.mean(X_sub, axis=0)
+            hbos_sub_val = np.array([mahalanobis(x, mean_sub, inv_cov_sub) for x in X_val_scaled])
+            lc_scores['HBOS'].append(roc_auc_score(y_val, hbos_sub_val))
+        except np.linalg.LinAlgError:
+            lc_scores['HBOS'].append(np.nan)  # Skip if singular
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for model in lc_scores:
+    ax.plot(lc_sizes, lc_scores[model], marker='o', label=model)
+ax.set_xlabel('Training Set Size')
+ax.set_ylabel('Validation AUC')
+ax.set_title('Learning Curves: Validation AUC vs Training Size (Churn Dataset)')
+ax.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'learning_curves.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 17: Plot 9 - Boxplot of Anomaly Scores (Normal vs Churn for Comparison)
+# Prepare data for boxplot
+normal_mask = y_test == 0
+churn_mask = y_test == 1
+score_data = []
+for model, score in anomaly_scores.items():
+    score_df = pd.DataFrame({
+        'Score': np.concatenate([score[normal_mask], score[churn_mask]]),
+        'Class': ['Normal'] * sum(normal_mask) + ['Churn'] * sum(churn_mask),
+        'Model': [model] * len(score)
+    })
+    score_data.append(score_df)
+
+all_scores_df = pd.concat(score_data)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.boxplot(data=all_scores_df, x='Model', y='Score', hue='Class', ax=ax)
+ax.set_title('Distribution of Anomaly Scores by Model and Class (Churn Dataset)')
+ax.set_ylabel('Anomaly Score (Higher = More Anomalous)')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'anomaly_scores_boxplot.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+# %%
+# Cell 18: Plot 10 - Radar Chart for Multi-Metric Comparison
+# Normalize metrics for radar chart (0-1 scale)
+from math import pi
+metrics_radar = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'AUC-ROC', 'Specificity']
+angles = [n / float(len(metrics_radar)) * 2 * pi for n in range(len(metrics_radar))]
+angles += angles[:1]  # Complete the circle
+
+fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection='polar'))
+for idx, model in enumerate(models):
+    values = [metrics_df.loc[model, m] for m in metrics_radar]
+    values += values[:1]
+    ax.plot(angles, values, 'o-', linewidth=2, label=model)
+    ax.fill(angles, values, alpha=0.25)
+
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(metrics_radar)
+ax.set_ylim(0, 1)
+ax.set_title('Radar Chart: Multi-Metric Performance Comparison (Churn Dataset)', size=16, y=1.1)
+ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, 'radar_chart.png'), dpi=300, bbox_inches='tight')
+plt.show()
+
+print("All plots saved successfully to:", save_dir)
